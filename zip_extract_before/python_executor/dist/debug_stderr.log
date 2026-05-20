@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "gui.py", line 1200, in <module>
+  File "tkinter\__init__.py", line 2326, in __init__
+_tkinter.TclError: Can't find a usable init.tcl in the following directories: 
+    {C:\Users\ADMINI~1\AppData\Local\Temp\_MEI236762\_tcl_data} C:/Users/ADMINI~1/AppData/Local/Temp/lib/tcl8.6 D:/temp_tester/arb_system/python_executor/lib/tcl8.6 D:/temp_tester/arb_system/lib/tcl8.6 D:/temp_tester/arb_system/python_executor/library D:/temp_tester/arb_system/library D:/temp_tester/arb_system/tcl8.6.12/library D:/temp_tester/tcl8.6.12/library
+
+
+
+This probably means that Tcl wasn't installed properly.
+
+[PYI-26864:ERROR] Failed to execute script 'gui' due to unhandled exception!
