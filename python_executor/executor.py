@@ -110,9 +110,6 @@ def resolve_filling_mode(symbol_info, request):
 
         if order_check_ok(check):
             return filling, check, failures
-        if check and check.retcode != 10030:
-            return filling, check, failures
-
         if check:
             failures.append(f"{filling_name(filling)}={check.retcode} {check.comment}")
         else:
@@ -160,22 +157,20 @@ def place_order(terminal_path, order_type, symbol="EURUSD", lot=0.1):
 
     tick = mt5.symbol_info_tick(symbol)
     if not tick:
-        mt5.shutdown()
         return {"error": f"No tick data for {symbol}", "retcode": -2}
 
     price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
-        mt5.shutdown()
         return {"error": f"Symbol {symbol} not found", "retcode": -3}
 
     request_base = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
-        "volume": lot,
-        "type": order_type,
-"price": price,
+            "volume": lot,
+            "type": order_type,
+            "price": price,
         "deviation": 5,
         "magic": 0,
         "comment": "martingale",
@@ -184,14 +179,12 @@ def place_order(terminal_path, order_type, symbol="EURUSD", lot=0.1):
 
     filling, order_check, failures = resolve_filling_mode(symbol_info, request_base)
     if filling is None:
-        mt5.shutdown()
         return {
             "error": "No supported filling mode",
             "retcode": 10030,
             "comment": "; ".join(failures),
         }
     if order_check and not order_check_ok(order_check):
-        mt5.shutdown()
         return {
             "error": "Order check failed",
             "retcode": order_check.retcode,
@@ -204,10 +197,8 @@ def place_order(terminal_path, order_type, symbol="EURUSD", lot=0.1):
     result = mt5.order_send(request)
     
     if result is None:
-        mt5.shutdown()
         return {"error": "Order send returned None (IPC failure)", "retcode": -1000}
     
-    mt5.shutdown()
     return result
 
 def close_order(terminal_path, order_type, symbol="EURUSD", lot=0.1):

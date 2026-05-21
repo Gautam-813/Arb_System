@@ -10,7 +10,6 @@ from pathlib import Path
 import subprocess
 import os
 import sys
-from contextlib import contextmanager
 
 SYMBOL_FILLING_FOK = getattr(mt5, "SYMBOL_FILLING_FOK", 1)
 SYMBOL_FILLING_IOC = getattr(mt5, "SYMBOL_FILLING_IOC", 2)
@@ -35,16 +34,42 @@ MANUAL_MAGIC_BASE = 87000000
 # each other's connection.
 _mt5_lock = threading.Lock()
 
-@contextmanager
-def _mt5_session(path):
-    """Thread‑safe MT5 session: acquire global lock → init → yield → shutdown."""
+# ── Persistent MT5 session ───────────────────────────
+# mt5.initialize() is a process-wide singleton.  Calling initialize() +
+# shutdown() on every API call costs 50-500ms each time.  We now keep
+# the connection open for the lifetime of the process and auto-reconnect
+# only if the terminal goes away.
+_mt5_connected: dict[str, bool] = {}          # path -> is_connected
+
+def _ensure_mt5(path: str) -> None:
+    """Acquire the global lock and (re)connect if needed."""
     with _mt5_lock:
-        if not mt5.initialize(path=path):
-            raise RuntimeError(f"MT5 init failed: {path}")
-        try:
-            yield
-        finally:
-            mt5.shutdown()
+        if not _mt5_connected.get(path) or not mt5.terminal_info():
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            if mt5.initialize(path=path):
+                _mt5_connected[path] = True
+            else:
+                _mt5_connected[path] = False
+                raise RuntimeError(f"MT5 init failed: {path}")
+
+def _shutdown_mt5(path: str | None = None) -> None:
+    """Shut down MT5 on exit (or all sessions if path is None)."""
+    with _mt5_lock:
+        if path:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            _mt5_connected.pop(path, None)
+        else:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            _mt5_connected.clear()
 
 # ── Colors ───────────────────────────────────────────
 BG      = "#0a0e1a"
@@ -107,8 +132,8 @@ def connect_core_socket(connect_timeout=5.0, read_timeout=None):
 
 def get_symbols(path):
     try:
-        with _mt5_session(path):
-            symbols = [s.name for s in mt5.symbols_get() if s.visible]
+        _ensure_mt5(path)
+        symbols = [s.name for s in mt5.symbols_get() if s.visible]
         return sorted(symbols)
     except RuntimeError:
         return []
@@ -145,6 +170,12 @@ def filling_candidates(symbol_info):
     return candidates
 
 def resolve_filling_mode(symbol_info, request):
+    # Cache: filling mode per (path, symbol, order_type) is stable — reuse.
+    cache_key = (request.get("path", ""), request.get("symbol", ""), request.get("type"))
+    cached = _filling_mode_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     failures = []
     for filling in filling_candidates(symbol_info):
         check_request = dict(request)
@@ -152,42 +183,59 @@ def resolve_filling_mode(symbol_info, request):
         check = mt5.order_check(check_request)
 
         if order_check_ok(check):
+            _filling_mode_cache[cache_key] = (filling, check, failures)
             return filling, check, failures
-        if check and check.retcode != 10030:
-            return filling, check, failures
-
         if check:
             failures.append(f"{filling_name(filling)}={check.retcode} {check.comment}")
         else:
             failures.append(f"{filling_name(filling)}=no order_check result")
 
-    return None, None, failures
+    result = (None, None, failures)
+    _filling_mode_cache[cache_key] = result
+    return result
 
 def order_check_ok(check):
     return check and check.retcode in (0, mt5.TRADE_RETCODE_DONE)
 
 def get_filling_mode(path, symbol):
     try:
-        with _mt5_session(path):
-            info = mt5.symbol_info(symbol)
+        _ensure_mt5(path)
+        info = mt5.symbol_info(symbol)
         candidates = filling_candidates(info)
         return candidates[0] if candidates else mt5.ORDER_FILLING_IOC
     except:
         return mt5.ORDER_FILLING_IOC
 
+# ── Filling-mode cache ──────────────────────────────────────
+# resolve_filling_mode / get_filling_mode each call mt5.order_check() /
+# mt5.symbol_info(), which costs 50-100ms per call.  A symbol's filling
+# mode never changes mid-session, so we cache the result per (path,symbol).
+_filling_mode_cache: dict = {}
+
+def get_filling_mode_cached(path, symbol):
+    key = (path, symbol)
+    if key in _filling_mode_cache:
+        return _filling_mode_cache[key]
+    result = get_filling_mode(path, symbol)
+    _filling_mode_cache[key] = result
+    return result
+
+def clear_filling_mode_cache():
+    _filling_mode_cache.clear()
+
 def get_spread(path, symbol):
     try:
-        with _mt5_session(path):
-            tick = mt5.symbol_info_tick(symbol)
-            info = mt5.symbol_info(symbol)
+        _ensure_mt5(path)
+        tick = mt5.symbol_info_tick(symbol)
+        info = mt5.symbol_info(symbol)
         return round((tick.ask - tick.bid) / info.point)
     except:
         return 9999
 
 def is_position_open(path, ticket):
     try:
-        with _mt5_session(path):
-            positions = mt5.positions_get()
+        _ensure_mt5(path)
+        positions = mt5.positions_get()
         tickets = [p.ticket for p in positions] if positions else []
         return ticket in tickets
     except:
@@ -219,16 +267,16 @@ def wait_for_position_ticket(path, symbol, ticket=None, magic=None, comment=None
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with _mt5_session(path):
-                pt = current_position_ticket(symbol, ticket=ticket, magic=magic, comment=comment)
+            _ensure_mt5(path)
+            pt = current_position_ticket(symbol, ticket=ticket, magic=magic, comment=comment)
             if pt:
                 return pt
         except RuntimeError:
             pass
         time.sleep(0.2)
     try:
-        with _mt5_session(path):
-            return current_position_ticket(symbol, ticket=ticket, magic=magic, comment=comment)
+        _ensure_mt5(path)
+        return current_position_ticket(symbol, ticket=ticket, magic=magic, comment=comment)
     except RuntimeError:
         return None
 
@@ -240,121 +288,122 @@ def wait_until_position_closed(path, ticket, timeout=3.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with _mt5_session(path):
-                if not current_position_is_open(ticket):
-                    return True
+            _ensure_mt5(path)
+            if not current_position_is_open(ticket):
+                return True
         except RuntimeError:
             pass
         time.sleep(0.2)
     try:
-        with _mt5_session(path):
-            return not current_position_is_open(ticket)
+        _ensure_mt5(path)
+        return not current_position_is_open(ticket)
     except RuntimeError:
         return False
 
 def place_order(path, symbol, order_type, lot, magic=0, comment=""):
     try:
-        with _mt5_session(path):
-            # Check if terminal is connected
-            terminal_info = mt5.terminal_info()
-            if not terminal_info or not terminal_info.connected:
-                return {"error": "Terminal not connected", "retcode": -2, "comment": "No connection to broker"}
+        _ensure_mt5(path)
+        # Check if terminal is connected
+        terminal_info = mt5.terminal_info()
+        if not terminal_info or not terminal_info.connected:
+            return {"error": "Terminal not connected", "retcode": -2, "comment": "No connection to broker"}
 
-            # Check account info
-            account_info = mt5.account_info()
-            if not account_info:
-                return {"error": "No account info", "retcode": -3, "comment": "Cannot get account information"}
+        # Check account info
+        account_info = mt5.account_info()
+        if not account_info:
+            return {"error": "No account info", "retcode": -3, "comment": "Cannot get account information"}
 
-            # Check if trading is allowed
-            if not account_info.trade_allowed:
-                return {"error": "Trading not allowed", "retcode": -4, "comment": "Trading disabled on account"}
+        # Check if trading is allowed
+        if not account_info.trade_allowed:
+            return {"error": "Trading not allowed", "retcode": -4, "comment": "Trading disabled on account"}
 
-            if not account_info.trade_expert:
-                return {"error": "Expert trading not allowed", "retcode": -5, "comment": "Automated trading disabled on account"}
+        if not account_info.trade_expert:
+            return {"error": "Expert trading not allowed", "retcode": -5, "comment": "Automated trading disabled on account"}
 
-            # Get symbol info
-            tick = mt5.symbol_info_tick(symbol)
-            if not tick:
-                return {"error": "No symbol data", "retcode": -5, "comment": f"No tick data for {symbol}"}
+        # Get symbol info
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            return {"error": "No symbol data", "retcode": -5, "comment": f"No tick data for {symbol}"}
 
-            # Check if symbol is tradable
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info or not symbol_info.visible:
-                return {"error": "Symbol not available", "retcode": -6, "comment": f"{symbol} not visible"}
+        # Check if symbol is tradable
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info or not symbol_info.visible:
+            return {"error": "Symbol not available", "retcode": -6, "comment": f"{symbol} not visible"}
 
-            # Check if symbol supports market orders
-            if symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
-                return {"error": "Symbol trading disabled", "retcode": -8, "comment": f"{symbol} trading is disabled"}
+        # Check if symbol supports market orders
+        if symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+            return {"error": "Symbol trading disabled", "retcode": -8, "comment": f"{symbol} trading is disabled"}
 
-            if not symbol_info.select:
-                select_result = mt5.symbol_select(symbol, True)
-                if not select_result:
-                    return {"error": "Cannot select symbol", "retcode": -7, "comment": f"Cannot select {symbol}"}
-            
-            # Verify symbol is selected
-            symbol_info_verify = mt5.symbol_info(symbol)
-            if not symbol_info_verify or not symbol_info_verify.select:
-                return {"error": "Symbol not selected", "retcode": -7, "comment": f"{symbol} not selected for trading"}
+        if not symbol_info.select:
+            select_result = mt5.symbol_select(symbol, True)
+            if not select_result:
+                return {"error": "Cannot select symbol", "retcode": -7, "comment": f"Cannot select {symbol}"}
+        
+        # Verify symbol is selected
+        symbol_info_verify = mt5.symbol_info(symbol)
+        if not symbol_info_verify or not symbol_info_verify.select:
+            return {"error": "Symbol not selected", "retcode": -7, "comment": f"{symbol} not selected for trading"}
 
-            price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-            check_base = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": float(lot),
-                "type": order_type,
-                "price": price,
-                "deviation": 20,
-                "magic": magic,
-                "comment": comment,
-                "type_time": mt5.ORDER_TIME_GTC,
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+        check_base = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "path":  path,
+            "volume": float(lot),
+            "type": order_type,
+            "price": price,
+            "deviation": 20,
+            "magic": magic,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        filling, test_margin_check, filling_failures = resolve_filling_mode(symbol_info, check_base)
+        
+        if filling is None:
+            contract_size = symbol_info.trade_contract_size
+            margin_required = (price * contract_size * float(lot)) / account_info.leverage
+
+            if margin_required > account_info.margin_free:
+                return {"error": "Insufficient margin", "retcode": -100, "comment": f"Need ${margin_required:.2f}, have ${account_info.margin_free:.2f}"}
+            return {
+                "error": "No supported filling mode",
+                "retcode": 10030,
+                "comment": "; ".join(filling_failures) or "order_check rejected all filling modes",
             }
-            filling, test_margin_check, filling_failures = resolve_filling_mode(symbol_info, check_base)
-            
-            if filling is None:
-                contract_size = symbol_info.trade_contract_size
-                margin_required = (price * contract_size * float(lot)) / account_info.leverage
 
-                if margin_required > account_info.margin_free:
-                    return {"error": "Insufficient margin", "retcode": -100, "comment": f"Need ${margin_required:.2f}, have ${account_info.margin_free:.2f}"}
-                return {
-                    "error": "No supported filling mode",
-                    "retcode": 10030,
-                    "comment": "; ".join(filling_failures) or "order_check rejected all filling modes",
-                }
+        if test_margin_check and not order_check_ok(test_margin_check):
+            return {
+                "error": "Order check failed",
+                "retcode": test_margin_check.retcode,
+                "comment": test_margin_check.comment,
+            }
 
-            if test_margin_check and not order_check_ok(test_margin_check):
-                return {
-                    "error": "Order check failed",
-                    "retcode": test_margin_check.retcode,
-                    "comment": test_margin_check.comment,
-                }
+        # Log filling mode
+        broker_name = path.split('\\')[-2] if '\\' in path else 'Unknown'
+        print(f"DEBUG [{broker_name}]: Using filling={filling} ({filling_name(filling)}) for {symbol}")
 
-            # Log filling mode
-            broker_name = path.split('\\')[-2] if '\\' in path else 'Unknown'
-            print(f"DEBUG [{broker_name}]: Using filling={filling} ({filling_name(filling)}) for {symbol}")
+        request = dict(check_base)
+        request["type_filling"] = filling
 
-            request = dict(check_base)
-            request["type_filling"] = filling
+        result = mt5.order_send(request)
+        if result is None:
+            last_error = mt5.last_error()
+            return {"error": f"Order send failed - last error: {last_error}", "retcode": -1000, "comment": "API returned None"}
 
-            result = mt5.order_send(request)
-            if result is None:
-                last_error = mt5.last_error()
-                return {"error": f"Order send failed - last error: {last_error}", "retcode": -1000, "comment": "API returned None"}
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            return {
+                "error": "Order send failed",
+                "retcode": result.retcode,
+                "comment": result.comment,
+                "order": getattr(result, "order", None),
+                "deal": getattr(result, "deal", None),
+            }
 
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                return {
-                    "error": "Order send failed",
-                    "retcode": result.retcode,
-                    "comment": result.comment,
-                    "order": getattr(result, "order", None),
-                    "deal": getattr(result, "deal", None),
-                }
-
-            result_retcode = result.retcode
-            result_comment = result.comment
-            result_order = getattr(result, "order", None)
-            result_deal = getattr(result, "deal", None)
-            # MT5 session closes here (shutdown + lock release)
+        result_retcode = result.retcode
+        result_comment = result.comment
+        result_order = getattr(result, "order", None)
+        result_deal = getattr(result, "deal", None)
+        # MT5 session closes here (shutdown + lock release)
 
         # Position verification outside the lock — each poll opens its own
         # short _mt5_session so other threads are not starved.
@@ -392,61 +441,62 @@ def place_order(path, symbol, order_type, lot, magic=0, comment=""):
 
 def close_order(path, ticket, symbol, order_type, lot, magic=0, comment="arb_close"):
     try:
-        with _mt5_session(path):
-            if not current_position_is_open(ticket):
-                return {"ok": True, "retcode": 0, "comment": "Already flat", "ticket": ticket}
+        _ensure_mt5(path)
+        if not current_position_is_open(ticket):
+            return {"ok": True, "retcode": 0, "comment": "Already flat", "ticket": ticket}
 
-            tick       = mt5.symbol_info_tick(symbol)
-            symbol_info = mt5.symbol_info(symbol)
-            if not tick or not symbol_info:
-                return {"error": "No symbol data", "retcode": -5, "comment": f"No tick/symbol data for {symbol}"}
-                
-            close_type = mt5.ORDER_TYPE_SELL if order_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-            price      = tick.bid if order_type == mt5.ORDER_TYPE_BUY else tick.ask
-            request_base = {
-                "action":       mt5.TRADE_ACTION_DEAL,
-                "symbol":       symbol,
-                "volume":       float(lot),
-                "type":         close_type,
-                "position":     ticket,
-                "price":        price,
-                "deviation":    20,
-                "magic":        magic,
-                "comment":      comment,
-                "type_time":    mt5.ORDER_TIME_GTC,
-            }
-            filling, close_check, failures = resolve_filling_mode(symbol_info, request_base)
-            if filling is None:
-                return {"error": "No supported filling mode", "retcode": 10030, "comment": "; ".join(failures)}
-            if close_check and not order_check_ok(close_check):
-                return {"error": "Close check failed", "retcode": close_check.retcode, "comment": close_check.comment}
+        tick       = mt5.symbol_info_tick(symbol)
+        symbol_info = mt5.symbol_info(symbol)
+        if not tick or not symbol_info:
+            return {"error": "No symbol data", "retcode": -5, "comment": f"No tick/symbol data for {symbol}"}
+            
+        close_type = mt5.ORDER_TYPE_SELL if order_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price      = tick.bid if order_type == mt5.ORDER_TYPE_BUY else tick.ask
+        request_base = {
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "path":         path,
+            "volume":       float(lot),
+            "type":         close_type,
+            "position":     ticket,
+            "price":        price,
+            "deviation":    20,
+            "magic":        magic,
+            "comment":      comment,
+            "type_time":    mt5.ORDER_TIME_GTC,
+        }
+        filling, close_check, failures = resolve_filling_mode(symbol_info, request_base)
+        if filling is None:
+            return {"error": "No supported filling mode", "retcode": 10030, "comment": "; ".join(failures)}
+        if close_check and not order_check_ok(close_check):
+            return {"error": "Close check failed", "retcode": close_check.retcode, "comment": close_check.comment}
 
-            request = dict(request_base)
-            request["type_filling"] = filling
-            result = mt5.order_send(request)
-            if result is None:
-                last_error = mt5.last_error()
-                return {"error": f"Close send failed - last error: {last_error}", "retcode": -1000, "comment": "API returned None"}
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                return {
-                    "error": "Close send failed",
-                    "retcode": result.retcode,
-                    "comment": result.comment,
-                    "order": getattr(result, "order", None),
-                    "deal": getattr(result, "deal", None),
-                    "ticket": ticket,
-                }
-
-            # TRADE_RETCODE_DONE means MT5 accepted the close — no poll needed
+        request = dict(request_base)
+        request["type_filling"] = filling
+        result = mt5.order_send(request)
+        if result is None:
+            last_error = mt5.last_error()
+            return {"error": f"Close send failed - last error: {last_error}", "retcode": -1000, "comment": "API returned None"}
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
             return {
-                "ok": True,
+                "error": "Close send failed",
                 "retcode": result.retcode,
                 "comment": result.comment,
                 "order": getattr(result, "order", None),
                 "deal": getattr(result, "deal", None),
                 "ticket": ticket,
-                "filling": filling,
             }
+
+        # TRADE_RETCODE_DONE means MT5 accepted the close — no poll needed
+        return {
+            "ok": True,
+            "retcode": result.retcode,
+            "comment": result.comment,
+            "order": getattr(result, "order", None),
+            "deal": getattr(result, "deal", None),
+            "ticket": ticket,
+            "filling": filling,
+        }
     except RuntimeError:
         return {"error": "MT5 initialization failed", "retcode": -1, "comment": "Cannot connect to terminal"}
     except Exception as e:
@@ -480,34 +530,34 @@ def check_terminal_status(path, symbol, name):
     issues = []
 
     try:
-        with _mt5_session(path):
-            terminal_info = mt5.terminal_info()
-            if not terminal_info:
-                issues.append(f"{name}: Cannot get terminal info")
-            elif not terminal_info.connected:
-                issues.append(f"{name}: Not connected to broker")
+        _ensure_mt5(path)
+        terminal_info = mt5.terminal_info()
+        if not terminal_info:
+            issues.append(f"{name}: Cannot get terminal info")
+        elif not terminal_info.connected:
+            issues.append(f"{name}: Not connected to broker")
 
-            account_info = mt5.account_info()
-            if not account_info:
-                issues.append(f"{name}: Cannot get account info")
-            else:
-                if not account_info.trade_allowed:
-                    issues.append(f"{name}: Trading disabled on account")
-                if account_info.margin_free < 100:  # Basic check
-                    issues.append(f"{name}: Low margin (${account_info.margin_free:.2f})")
+        account_info = mt5.account_info()
+        if not account_info:
+            issues.append(f"{name}: Cannot get account info")
+        else:
+            if not account_info.trade_allowed:
+                issues.append(f"{name}: Trading disabled on account")
+            if account_info.margin_free < 100:  # Basic check
+                issues.append(f"{name}: Low margin (${account_info.margin_free:.2f})")
 
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                issues.append(f"{name}: Symbol {symbol} not found")
-            elif not symbol_info.visible:
-                issues.append(f"{name}: Symbol {symbol} not visible")
-            elif not symbol_info.select:
-                if not mt5.symbol_select(symbol, True):
-                    issues.append(f"{name}: Cannot select symbol {symbol}")
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            issues.append(f"{name}: Symbol {symbol} not found")
+        elif not symbol_info.visible:
+            issues.append(f"{name}: Symbol {symbol} not visible")
+        elif not symbol_info.select:
+            if not mt5.symbol_select(symbol, True):
+                issues.append(f"{name}: Cannot select symbol {symbol}")
 
-            tick = mt5.symbol_info_tick(symbol)
-            if not tick:
-                issues.append(f"{name}: No tick data for {symbol}")
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            issues.append(f"{name}: No tick data for {symbol}")
 
     except RuntimeError:
         issues.append(f"{name}: Cannot initialize MT5")
@@ -1059,29 +1109,29 @@ class ArbApp:
                 if not path:
                     continue
                 try:
-                    with _mt5_session(path):
-                        positions = mt5.positions_get()
-                        if not positions:
-                            self.log(f"CLOSE ALL: {name} already flat")
-                            continue
-                        for pos in positions:
-                            close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                            price = mt5.symbol_info_tick(pos.symbol).bid if pos.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(pos.symbol).ask
-                            req = {
-                                "action": mt5.TRADE_ACTION_DEAL,
-                                "symbol": pos.symbol,
-                                "volume": pos.volume,
-                                "type": close_type,
-                                "position": pos.ticket,
-                                "price": price,
-                                "deviation": 20,
-                                "magic": pos.magic,
-                                "comment": "pnl_close",
-                                "type_time": mt5.ORDER_TIME_GTC,
-                                "type_filling": mt5.ORDER_FILLING_IOC,
-                            }
-                            mt5.order_send(req)
-                        self.log(f"CLOSE ALL: {name} close sent for {len(positions)} positions")
+                    _ensure_mt5(path)
+                    positions = mt5.positions_get()
+                    if not positions:
+                        self.log(f"CLOSE ALL: {name} already flat")
+                        continue
+                    for pos in positions:
+                        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                        price = mt5.symbol_info_tick(pos.symbol).bid if pos.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(pos.symbol).ask
+                        req = {
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "symbol": pos.symbol,
+                            "volume": pos.volume,
+                            "type": close_type,
+                            "position": pos.ticket,
+                            "price": price,
+                            "deviation": 20,
+                            "magic": pos.magic,
+                            "comment": "pnl_close",
+                            "type_time": mt5.ORDER_TIME_GTC,
+                            "type_filling": mt5.ORDER_FILLING_IOC,
+                        }
+                        mt5.order_send(req)
+                    self.log(f"CLOSE ALL: {name} close sent for {len(positions)} positions")
                 except Exception as e:
                     self.log(f"CLOSE ALL: {name} error - {e}")
             with self.state_lock:
@@ -1628,10 +1678,10 @@ class ArbApp:
                     m_tick = None
                     s_tick = None
                     try:
-                        with _mt5_session(m["path"]):
-                            m_tick = mt5.symbol_info_tick(m["symbol"])
-                        with _mt5_session(s["path"]):
-                            s_tick = mt5.symbol_info_tick(s["symbol"])
+                        _ensure_mt5(m["path"])
+                        m_tick = mt5.symbol_info_tick(m["symbol"])
+                        _ensure_mt5(s["path"])
+                        s_tick = mt5.symbol_info_tick(s["symbol"])
                     except:
                         pass
 
